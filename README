@@ -46,9 +46,6 @@ User input
 If stdin is a terminal, ua will get the message text via a text editor;
 otherwise, it will read it directly from stdin.
 
-Example system messages explaining how the shell tool might be used are
-provided in examples/system.
-
 
 Agent loop
 ----------
