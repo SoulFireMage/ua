@@ -72,6 +72,13 @@ ua() {
         && printf '%s\n' "$ANCHOR"
       ;;
 
+    search)
+      curl -f -s -L -S https://openrouter.ai/api/v1/models \
+        | jq -r '.data[].id' | sort -V | grep -v ':batch$' \
+        | grep -E -e "$(printf '%s\n' "${@:2}")"
+      return $((PIPESTATUS[0] || PIPESTATUS[4]))
+      ;;
+
     *)
       cat >&2 <<EOF
 Usage:
@@ -82,6 +89,7 @@ Usage:
   ua recap                      print the conversation history
   ua reset                      unset anchor, log, model and reasoning
   ua scratch [LOG]              anchor agent inside a scratch directory
+  ua search [PATTERN]...        search models by regular expression
   ua system                     add a system message to the conversation
   ua user                       add a user message to the conversation
 
