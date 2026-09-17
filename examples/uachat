@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-import getpass, json, os, re, shutil, subprocess, sys, tempfile, time
+import getpass, io, json, os, re, select, shutil, signal, subprocess, sys, tempfile, time
 import urllib.error, urllib.request
 from pathlib import Path
 from contextlib import suppress
@@ -361,6 +361,61 @@ def doctor(config):
   else:
     print('models:     no cache; run:', NAME, 'models --refresh')
 
+def extract_text(item):
+  content = item.get('content')
+  if isinstance(content, str):
+    return content
+  parts = []
+  if isinstance(content, list):
+    for part in content:
+      if isinstance(part, dict):
+        for kind in ('text', 'refusal'):
+          if isinstance(part.get(kind), str):
+            parts.append(part[kind])
+  return ''.join(parts)
+
+def history(config):
+  path = Path(expand(config.get('log') or 'ua.log'))
+  messages = []
+  with suppress(OSError):
+    with open(path, 'r', encoding = 'utf-8') as stream:
+      for line in stream:
+        if not (line := line.strip()):
+          continue
+        with suppress(ValueError):
+          item = json.loads(line)
+          if item.get('type') == 'message':
+            text = extract_text(item).strip('\n')
+            if text:
+              messages.append((item.get('role') or 'system', text))
+  return messages
+
+def assistant_responses(config):
+  return [text for role, text in history(config) if role == 'assistant']
+
+def copy_text(config, text):
+  for tool in ('termux-clipboard-set', 'pbcopy', 'wl-copy', 'xclip'):
+    if path := shutil.which(tool):
+      command = [path] + (['-selection', 'clipboard'] if tool == 'xclip' else [])
+      with suppress(Exception):
+        subprocess.run(command, input = text, text = True, check = True)
+        return f'copied {len(text)} bytes to the clipboard with {tool}'
+  log = Path(expand(config.get('log') or 'ua.log'))
+  path = Path(str(log) + '.last.txt')
+  with suppress(OSError):
+    path.write_text(text, encoding = 'utf-8')
+    return f'copied {len(text)} bytes to {path}'
+  return 'could not copy the response'
+
+def show_last(config, count = 1):
+  responses = assistant_responses(config)
+  if not responses:
+    die('no assistant responses in', config.get('log') or 'ua.log')
+  with suppress(ValueError):
+    count = max(int(count), 1)
+  for text in responses[-count:]:
+    print(text)
+
 def colourise_recap(text):
   lines = []
   for line in text.splitlines():
@@ -482,14 +537,419 @@ def help_text():
   Ctrl-C twice     quit (once clears the line you are typing)
   Ctrl-D           quit''')
 
-def chat(config):
-  if not resolve_key(config):
-    config = prompt_for_key(config)
-  if not config.get('model'):
-    if sys.stdin.isatty() and sys.stdout.isatty():
-      pick_model(config)
+def _wrap(text, width):
+  lines = []
+  for paragraph in text.split('\n'):
+    if not paragraph:
+      lines.append('')
+      continue
+    current = ''
+    for word in paragraph.split(' '):
+      candidate = word if not current else current + ' ' + word
+      if len(candidate) <= width:
+        current = candidate
+        continue
+      if current:
+        lines.append(current)
+      while len(word) > width:
+        lines.append(word[:width])
+        word = word[width:]
+      current = word
+    lines.append(current)
+  return lines
+
+def _render_blocks(blocks, width):
+  lines = []
+  for role, text in blocks:
+    if role == 'user':
+      prefix, pair = '> ', 1
+    elif role == 'system':
+      prefix, pair = '| ', 2
+    elif role == 'info':
+      prefix, pair = '  ', 3
     else:
-      die('no model configured; run:', NAME, 'model')
+      prefix, pair = '  ', 0
+    for index, line in enumerate(_wrap(text, max(width - len(prefix), 1))):
+      lines.append((pair, (prefix if index == 0 else ' ' * len(prefix)) + line))
+    lines.append((0, ''))
+  return lines
+
+def tui_main(stdscr, config):
+  import curses
+
+  curses.raw()
+  curses.noecho()
+  curses.nonl()
+  stdscr.keypad(True)
+  with suppress(Exception):
+    curses.curs_set(1)
+  with suppress(Exception):
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_GREEN, -1)
+    curses.init_pair(2, curses.COLOR_BLUE, -1)
+    curses.init_pair(3, curses.COLOR_YELLOW, -1)
+  os.write(1, b'\x1b[?2004h')
+
+  blocks = history(config)
+  lines = ['']
+  cursor_y = cursor_x = 0
+  scroll = 0
+  running = True
+
+  def put(row, col, text, attr, width):
+    with suppress(curses.error):
+      stdscr.addnstr(row, col, text, width, attr)
+
+  def redraw():
+    nonlocal scroll
+    stdscr.erase()
+    height, width = stdscr.getmaxyx()
+    title = f' {NAME}  {config.get("model") or "no model"} '
+    put(0, 0, title.ljust(width), curses.A_REVERSE, width)
+    input_height = min(len(lines), max(1, height // 3))
+    box_height = input_height + 2
+    trans_top = 1
+    trans_bottom = height - box_height - 2
+    trans_height = max(trans_bottom - trans_top + 1, 1)
+    rendered = _render_blocks(blocks, width)
+    scroll = min(max(scroll, 0), max(len(rendered) - trans_height, 0))
+    start = max(len(rendered) - trans_height - scroll, 0)
+    for row in range(trans_height):
+      index = start + row
+      if index < len(rendered):
+        pair, line = rendered[index]
+        attr = curses.color_pair(pair) if pair else curses.A_NORMAL
+        put(trans_top + row, 0, line, attr, width)
+    top = height - box_height - 1
+    inner = max(width - 4, 1)
+    put(top, 0, TL + HORIZONTAL * (width - 2) + TR, curses.A_DIM, width)
+    yoff = max(0, cursor_y - input_height + 1)
+    xoff = max(0, cursor_x - inner + 1)
+    for row in range(input_height):
+      index = yoff + row
+      text = lines[index] if index < len(lines) else ''
+      put(top + 1 + row, 0,
+        VERTICAL + ' ' + text[xoff:xoff + inner].ljust(inner) + ' ' + VERTICAL,
+        curses.A_NORMAL, width)
+    put(top + box_height - 1, 0, BL + HORIZONTAL * (width - 2) + BR,
+      curses.A_DIM, width)
+    hint = ' Enter send  ^J newline  ^O editor  ^Y copy  ^C clear/quit  ^D quit '
+    put(height - 1, 0, hint.ljust(width - 1), curses.A_DIM, width - 1)
+    with suppress(curses.error):
+      stdscr.move(top + 1 + (cursor_y - yoff), min(2 + (cursor_x - xoff), width - 1))
+    stdscr.refresh()
+
+  def insert(text):
+    nonlocal cursor_y, cursor_x
+    for character in text:
+      if character in '\r\n':
+        current = lines[cursor_y]
+        lines[cursor_y] = current[:cursor_x]
+        lines.insert(cursor_y + 1, current[cursor_x:])
+        cursor_y += 1
+        cursor_x = 0
+      else:
+        current = lines[cursor_y]
+        lines[cursor_y] = current[:cursor_x] + character + current[cursor_x:]
+        cursor_x += 1
+
+  def clear_input():
+    nonlocal lines, cursor_y, cursor_x
+    lines = ['']
+    cursor_y = cursor_x = 0
+
+  def backspace():
+    nonlocal cursor_y, cursor_x
+    if cursor_x > 0:
+      current = lines[cursor_y]
+      lines[cursor_y] = current[:cursor_x - 1] + current[cursor_x:]
+      cursor_x -= 1
+    elif cursor_y > 0:
+      cursor_x = len(lines[cursor_y - 1])
+      lines[cursor_y - 1] += lines[cursor_y]
+      del lines[cursor_y]
+      cursor_y -= 1
+
+  def delete():
+    nonlocal cursor_y
+    current = lines[cursor_y]
+    if cursor_x < len(current):
+      lines[cursor_y] = current[:cursor_x] + current[cursor_x + 1:]
+    elif cursor_y < len(lines) - 1:
+      lines[cursor_y] = current + lines[cursor_y + 1]
+      del lines[cursor_y + 1]
+
+  def read_paste():
+    buffer = ''
+    while True:
+      try:
+        character = stdscr.get_wch()
+      except curses.error:
+        continue
+      if isinstance(character, int):
+        continue
+      buffer += character
+      if buffer.endswith('\x1b[201~'):
+        return buffer[:-6]
+      if len(buffer) > 100000:
+        return buffer
+
+  def read_escape():
+    sequence = ''
+    stdscr.timeout(50)
+    while True:
+      try:
+        character = stdscr.get_wch()
+      except curses.error:
+        break
+      if isinstance(character, int):
+        break
+      sequence += character
+      if character.isalpha() or character == '~' or len(sequence) > 16:
+        break
+    stdscr.timeout(-1)
+    if sequence == '[200~':
+      return ('paste', read_paste())
+    return ('esc', sequence)
+
+  def get_event(timeout = -1):
+    stdscr.timeout(timeout)
+    try:
+      character = stdscr.get_wch()
+    except curses.error:
+      return None
+    if isinstance(character, str):
+      if character == '\x1b':
+        return read_escape()
+      return ('char', character)
+    return ('key', character)
+
+  def capture(fn):
+    out, err = io.StringIO(), io.StringIO()
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = out, err
+    try:
+      fn()
+    except SystemExit:
+      pass
+    finally:
+      sys.stdout, sys.stderr = old_out, old_err
+    return (out.getvalue() + err.getvalue()).rstrip('\n')
+
+  def suspend(fn):
+    curses.def_prog_mode()
+    curses.endwin()
+    os.write(1, b'\x1b[?2004l')
+    try:
+      return fn()
+    finally:
+      os.write(1, b'\x1b[?2004h')
+      curses.reset_prog_mode()
+      stdscr.clear()
+      stdscr.refresh()
+
+  def stream():
+    nonlocal scroll
+    process = subprocess.Popen([sys.executable, ua_path(), 'agent'],
+      env = child_env(config), stdin = subprocess.DEVNULL,
+      stdout = subprocess.PIPE, stderr = subprocess.STDOUT)
+    blocks.append(('assistant', ''))
+    index = len(blocks) - 1
+    buffer = ''
+    stdscr.timeout(0)
+    try:
+      while True:
+        if select.select([process.stdout], [], [], 0.05)[0]:
+          data = os.read(process.stdout.fileno(), 4096)
+          if not data:
+            break
+          buffer += data.decode('utf-8', 'replace')
+          blocks[index] = ('assistant', buffer)
+          redraw()
+        elif process.poll() is not None:
+          break
+        elif (event := get_event(0)) and event == ('char', '\x03'):
+          process.send_signal(signal.SIGINT)
+          buffer += '\n[interrupted]'
+          blocks[index] = ('assistant', buffer)
+          redraw()
+    finally:
+      stdscr.timeout(-1)
+      with suppress(Exception):
+        process.wait(timeout = 5)
+    text = buffer.strip('\n')
+    if text:
+      blocks[index] = ('assistant', text)
+    else:
+      del blocks[index]
+    scroll = 0
+
+  def submit(text):
+    nonlocal scroll
+    message = text.strip()
+    if message.startswith('/'):
+      command(message)
+      return
+    if message:
+      blocks.append(('user', message))
+      run(config, 'user', stdin = message)
+    scroll = 0
+    stream()
+
+  def copy_last(argument = ''):
+    responses = assistant_responses(config)
+    if not responses:
+      blocks.append(('info', 'No assistant response to copy yet'))
+      return
+    count = 1
+    with suppress(ValueError):
+      count = max(int(argument), 1)
+    blocks.append(('info', copy_text(config, '\n\n'.join(responses[-count:]))))
+
+  def external_editor():
+    def edit():
+      return editor_text()
+    text = suspend(edit)
+    if text:
+      blocks.append(('user', text))
+      run(config, 'user', stdin = text)
+      stream()
+
+  def command(text):
+    nonlocal running
+    parts = text[1:].split(None, 1)
+    name = parts[0].lower() if parts else ''
+    argument = parts[1].strip() if len(parts) > 1 else ''
+    if name in ('q', 'quit', 'exit'):
+      running = False
+    elif name in ('m', 'model'):
+      suspend(lambda: pick_model(config, argument))
+    elif name == 'models':
+      refresh = argument in ('--refresh', '-r')
+      blocks.append(('info', capture(lambda: list_models(config,
+        '' if refresh else argument, refresh = refresh)) or '(no output)'))
+    elif name in ('r', 'reasoning'):
+      blocks.append(('info', capture(lambda: set_reasoning(config, argument or None))))
+    elif name in ('key', 'k'):
+      suspend(lambda: set_key(config))
+    elif name in ('fav', 'favorite'):
+      blocks.append(('info', capture(lambda: favourite(config, argument))))
+    elif name == 'log':
+      blocks.append(('info', capture(lambda: set_log(config, argument))))
+    elif name == 'recap':
+      blocks[:] = history(config)
+    elif name == 'copy':
+      copy_last(argument)
+    elif name in ('edit', 'e'):
+      external_editor()
+    elif name in ('doctor', 'diag'):
+      blocks.append(('info', capture(lambda: doctor(config))))
+    elif name in ('help', 'h', '?'):
+      blocks.append(('info', 'Commands: /model /models /reasoning /key /fav /log '
+        '/recap /copy /edit /doctor /quit  -  Enter sends, Ctrl-J adds a line'))
+    else:
+      blocks.append(('info', f'Unknown command {name!r}'))
+
+  try:
+    while running:
+      redraw()
+      event = get_event()
+      if event is None:
+        continue
+      kind, value = event
+      if kind == 'paste':
+        insert(value)
+        continue
+      if kind == 'esc':
+        continue
+      if kind == 'key':
+        if value == curses.KEY_LEFT:
+          if cursor_x > 0:
+            cursor_x -= 1
+          elif cursor_y > 0:
+            cursor_y -= 1
+            cursor_x = len(lines[cursor_y])
+        elif value == curses.KEY_RIGHT:
+          if cursor_x < len(lines[cursor_y]):
+            cursor_x += 1
+          elif cursor_y < len(lines) - 1:
+            cursor_y += 1
+            cursor_x = 0
+        elif value == curses.KEY_UP:
+          if cursor_y > 0:
+            cursor_y -= 1
+            cursor_x = min(cursor_x, len(lines[cursor_y]))
+          else:
+            scroll += 1
+        elif value == curses.KEY_DOWN:
+          if cursor_y < len(lines) - 1:
+            cursor_y += 1
+            cursor_x = min(cursor_x, len(lines[cursor_y]))
+          else:
+            scroll = max(scroll - 1, 0)
+        elif value == curses.KEY_ENTER:
+          submit('\n'.join(lines))
+          clear_input()
+        elif value in (curses.KEY_BACKSPACE, curses.KEY_DC):
+          delete() if value == curses.KEY_DC else backspace()
+        elif value == curses.KEY_HOME:
+          cursor_x = 0
+        elif value == curses.KEY_END:
+          cursor_x = len(lines[cursor_y])
+        elif value == curses.KEY_PPAGE:
+          scroll += 10
+        elif value == curses.KEY_NPAGE:
+          scroll = max(scroll - 10, 0)
+        continue
+      character = value
+      if character == '\x03':
+        if any(lines):
+          clear_input()
+        else:
+          running = False
+      elif character == '\x04':
+        if any(lines):
+          delete()
+        else:
+          running = False
+      elif character == '\r':
+        submit('\n'.join(lines))
+        clear_input()
+      elif character == '\n':
+        insert('\n')
+      elif character in ('\x7f', '\x08'):
+        backspace()
+      elif character == '\x15':
+        lines[cursor_y] = ''
+        cursor_x = 0
+      elif character == '\x01':
+        cursor_x = 0
+      elif character == '\x05':
+        cursor_x = len(lines[cursor_y])
+      elif character == '\x0b':
+        lines[cursor_y] = lines[cursor_y][:cursor_x]
+      elif character == '\x0f':
+        external_editor()
+      elif character == '\x19':
+        copy_last()
+      elif character == '\x12':
+        blocks[:] = history(config)
+        scroll = 0
+      elif character == '\t':
+        insert('  ')
+      elif character.isprintable():
+        insert(character)
+  finally:
+    os.write(1, b'\x1b[?2004l')
+
+def tui(config):
+  import locale
+  locale.setlocale(locale.LC_ALL, '')
+  import curses
+  curses.wrapper(tui_main, config)
+
+def plain_chat(config):
   banner(config)
   load_history()
   interrupted = False
@@ -522,6 +982,25 @@ def chat(config):
     save_history()
   print()
 
+def chat(config, plain = False):
+  if not resolve_key(config):
+    config = prompt_for_key(config)
+  if not config.get('model'):
+    if sys.stdin.isatty() and sys.stdout.isatty():
+      pick_model(config)
+    else:
+      die('no model configured; run:', NAME, 'model')
+  interactive = sys.stdin.isatty() and sys.stdout.isatty()
+  if plain or os.environ.get('UA_PLAIN') or not interactive:
+    plain_chat(config)
+    return
+  try:
+    import curses
+  except ImportError:
+    plain_chat(config)
+    return
+  tui(config)
+
 def usage():
   print(f'''\
 Usage: {NAME} [ACTION] [ARGUMENT]
@@ -533,23 +1012,29 @@ Actions:
   key                  set or replace the saved API key (prompts, or stdin)
   fav [MODEL]          toggle or list favourite models
   log [PATH]           show or set the conversation log file
+  last [N]             print the last N assistant responses, raw
+  copy [N]             copy the last N assistant responses to the clipboard
   config               print the configuration file path
   doctor               diagnose config, key, model and cache
   abort agent recap system user
                        run the corresponding ua action directly
+Options:
+  --plain              use the simple readline composer instead of the TUI
 Configuration is stored in {CONFIG_FILE}.
-Environment: API, KEY, MODEL, UA, EDITOR, NO_COLOR, UA_ASCII
+Environment: API, KEY, MODEL, UA, EDITOR, NO_COLOR, UA_ASCII, UA_PLAIN
 ''', end = '', file = sys.stderr)
   sys.exit(64)
 
 def main(argv):
   set_composer_keys()
   config = ensure_config()
+  plain = '--plain' in argv
+  argv = [arg for arg in argv if arg != '--plain']
   action = argv[0] if argv else 'chat'
   rest = argv[1:]
   match action:
     case 'chat':
-      chat(config)
+      chat(config, plain = plain)
     case 'model':
       pick_model(config, rest[0] if rest else '')
     case 'models':
@@ -564,6 +1049,16 @@ def main(argv):
       favourite(config, rest[0] if rest else '')
     case 'log':
       set_log(config, rest[0] if rest else '')
+    case 'last':
+      show_last(config, rest[0] if rest else 1)
+    case 'copy':
+      responses = assistant_responses(config)
+      if not responses:
+        die('no assistant responses in', config.get('log') or 'ua.log')
+      count = 1
+      with suppress(ValueError):
+        count = max(int(rest[0]), 1) if rest else 1
+      print(copy_text(config, '\n\n'.join(responses[-count:])))
     case 'config':
       print(CONFIG_FILE)
     case 'doctor' | 'diag':

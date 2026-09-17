@@ -75,11 +75,25 @@ Interactive wrapper
 -------------------
 
 examples/uachat is a small, dependency-free front end which adds a model
-picker and a boxed multi-line composer, storing its configuration in
+picker and an interactive chat loop, storing its configuration in
 ~/.config/ua/config.json and leaving the core ua script unchanged.
 
-Run 'uachat' to start a chat loop. Type a message and press Enter to
-send it; Ctrl-J or Shift-Enter inserts a newline. The slash commands are:
+On a terminal, 'uachat' opens a full-screen interface: a scrollable
+transcript above a bordered multi-line input box, with the model and log
+shown in the title bar. Type and press Enter to send; Ctrl-J inserts a
+newline. Mouse reporting is left off so the terminal's own text selection
+and paste work normally, and bracketed paste is handled so pasted text
+(including newlines) is inserted literally rather than being sent.
+
+  Enter            send the message
+  Ctrl-J           insert a newline
+  Ctrl-O           compose the message in $EDITOR instead
+  Ctrl-Y           copy the last response, raw, to the clipboard
+  Up/Down, PgUp/PgDn   move the cursor, or scroll the transcript
+  Ctrl-C           clear the input; again on an empty input to quit
+  Ctrl-D, /quit    quit
+
+The slash commands work in the box:
 
   /model [QUERY]    pick a model from the API's model list (saved)
   /models [QUERY]   list matching models; --refresh refetches
@@ -87,15 +101,20 @@ send it; Ctrl-J or Shift-Enter inserts a newline. The slash commands are:
   /key              replace the saved API key
   /fav [MODEL]      add or remove a favourite model
   /log [PATH]       show or set the conversation log
-  /recap            print the conversation so far
+  /recap            reload the conversation from the log
+  /copy [N]         copy the last N responses, raw, to the clipboard
   /edit             compose a message in $EDITOR
   /doctor           show paths, model, key source and cache status
   /help, /quit
 
-Ctrl-D or /quit leaves the loop; Ctrl-C clears the line you are typing,
-and a second Ctrl-C in a row quits. Pasted keys are sanitised to strip
-bracketed-paste and other terminal escape sequences, and /doctor prints
-which key is in use without revealing it.
+'uachat --plain' (or UA_PLAIN=1) uses a simpler readline composer that
+keeps the normal scrollback, for terminals where the full-screen
+interface is awkward. Piped or redirected input also uses it.
+
+'uachat last [N]' prints the last N assistant responses, raw, to stdout,
+and 'uachat copy [N]' copies them. Copying uses termux-clipboard-set,
+pbcopy, wl-copy or xclip when available and otherwise writes them beside
+the log as <log>.last.txt.
 
 'uachat model' chooses a model at the command line and saves it for next
 time, while 'uachat models QUERY' lists matches. The model list is read
@@ -103,7 +122,9 @@ from the API's /models endpoint and cached for a day in
 ~/.config/ua/models.json, so the picker still works offline. If no key is
 configured, uachat prompts for one and writes it to the key file named in
 the configuration, mode 600; 'uachat key' replaces it later, prompting on
-a terminal or reading the key from stdin when piped.
+a terminal or reading the key from stdin when piped. Pasted keys are
+sanitised to strip bracketed-paste and other escape sequences, and
+/doctor prints which key is in use without revealing it.
 
 The core actions can also be run directly, e.g. 'uachat agent' or
 'uachat recap', with the configured API, key, model and log passed in the
