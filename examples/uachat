@@ -83,6 +83,16 @@ def resolve_key(config):
       return clean_secret(Path(expand(path)).read_text(encoding = 'utf-8'))
   return None
 
+def write_key(config, secret):
+  path = Path(expand(config.get('key_file') or DEFAULT_KEY_FILE))
+  path.parent.mkdir(parents = True, exist_ok = True)
+  path.write_text(secret + '\n', encoding = 'utf-8')
+  os.chmod(path, 0o600)
+  config['key_file'] = str(path)
+  save_config(config)
+  print('Saved', path, '->', mask(secret))
+  return path
+
 def prompt_for_key(config):
   if not sys.stdin.isatty():
     die('no API key configured; set KEY or write one to', config.get('key_file'))
@@ -90,14 +100,20 @@ def prompt_for_key(config):
   key = clean_secret(getpass.getpass('API key: '))
   if not key:
     die('aborted')
-  path = Path(expand(config.get('key_file') or DEFAULT_KEY_FILE))
-  path.parent.mkdir(parents = True, exist_ok = True)
-  path.write_text(key + '\n', encoding = 'utf-8')
-  os.chmod(path, 0o600)
-  config['key_file'] = str(path)
-  save_config(config)
-  print('Saved', path, '->', mask(key))
+  write_key(config, key)
   return config
+
+def set_key(config, secret = None):
+  if secret is None:
+    if sys.stdin.isatty():
+      secret = getpass.getpass('API key: ')
+    else:
+      secret = sys.stdin.read()
+  secret = clean_secret(secret)
+  if not secret:
+    die('empty key')
+  write_key(config, secret)
+  return secret
 
 def ua_path():
   if os.environ.get('UA'):
@@ -428,6 +444,8 @@ def command(config, line):
     list_models(config, '' if refresh else argument, refresh = refresh)
   elif name in ('r', 'reasoning'):
     set_reasoning(config, argument or None)
+  elif name in ('key', 'k'):
+    set_key(config, None)
   elif name == 'recap':
     _, output = run(config, 'recap', capture = True)
     sys.stdout.write(colourise_recap(output))
@@ -452,6 +470,7 @@ def help_text():
   /model [QUERY]   pick a model (saved for next time)
   /models [Q]      list matching models (/models --refresh to refetch)
   /reasoning [E]   set effort, or 'off'/'default' (no argument shows it)
+  /key             replace the saved API key
   /fav [MODEL]     add/remove a favourite model
   /log [PATH]      show or set the conversation log
   /recap           print the conversation so far
@@ -511,6 +530,7 @@ Actions:
   model [QUERY]        search for and select a model, saved to config
   models [QUERY]       list matching models (--refresh to refetch)
   reasoning [EFFORT]   set reasoning effort, 'off' or 'default'
+  key                  set or replace the saved API key (prompts, or stdin)
   fav [MODEL]          toggle or list favourite models
   log [PATH]           show or set the conversation log file
   config               print the configuration file path
@@ -538,6 +558,8 @@ def main(argv):
       list_models(config, query, refresh = refresh)
     case 'reasoning':
       set_reasoning(config, rest[0] if rest else None)
+    case 'key':
+      set_key(config)
     case 'fav' | 'favorite':
       favourite(config, rest[0] if rest else '')
     case 'log':

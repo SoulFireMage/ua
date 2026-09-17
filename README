@@ -84,6 +84,7 @@ send it; Ctrl-J or Shift-Enter inserts a newline. The slash commands are:
   /model [QUERY]    pick a model from the API's model list (saved)
   /models [QUERY]   list matching models; --refresh refetches
   /reasoning [E]    set reasoning effort, 'off' or 'default'
+  /key              replace the saved API key
   /fav [MODEL]      add or remove a favourite model
   /log [PATH]       show or set the conversation log
   /recap            print the conversation so far
@@ -101,7 +102,8 @@ time, while 'uachat models QUERY' lists matches. The model list is read
 from the API's /models endpoint and cached for a day in
 ~/.config/ua/models.json, so the picker still works offline. If no key is
 configured, uachat prompts for one and writes it to the key file named in
-the configuration, mode 600.
+the configuration, mode 600; 'uachat key' replaces it later, prompting on
+a terminal or reading the key from stdin when piped.
 
 The core actions can also be run directly, e.g. 'uachat agent' or
 'uachat recap', with the configured API, key, model and log passed in the
