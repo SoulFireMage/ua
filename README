@@ -88,7 +88,13 @@ send it; Ctrl-J or Shift-Enter inserts a newline. The slash commands are:
   /log [PATH]       show or set the conversation log
   /recap            print the conversation so far
   /edit             compose a message in $EDITOR
+  /doctor           show paths, model, key source and cache status
   /help, /quit
+
+Ctrl-D or /quit leaves the loop; Ctrl-C clears the line you are typing,
+and a second Ctrl-C in a row quits. Pasted keys are sanitised to strip
+bracketed-paste and other terminal escape sequences, and /doctor prints
+which key is in use without revealing it.
 
 'uachat model' chooses a model at the command line and saves it for next
 time, while 'uachat models QUERY' lists matches. The model list is read

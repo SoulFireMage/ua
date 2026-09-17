@@ -33,6 +33,14 @@ def die(*args):
 def expand(path):
   return os.path.expanduser(os.path.expandvars(str(path)))
 
+def clean_secret(text):
+  text = re.sub(r'\x1b\[[0-9;?]*[ -/]*[@-~]', '', text)
+  text = re.sub(r'\x1b[\[\]]', '', text)
+  return re.sub(r'[\x00-\x1f\x7f]', '', text).strip()
+
+def mask(secret):
+  return f'{secret[:8]}... (length {len(secret)})' if secret else '(empty)'
+
 def load_json(path, default):
   try:
     with open(path, 'r', encoding = 'utf-8') as stream:
@@ -72,14 +80,14 @@ def resolve_key(config):
   path = config.get('key_file')
   if path and Path(expand(path)).exists():
     with suppress(OSError):
-      return Path(expand(path)).read_text(encoding = 'utf-8').strip()
+      return clean_secret(Path(expand(path)).read_text(encoding = 'utf-8'))
   return None
 
 def prompt_for_key(config):
   if not sys.stdin.isatty():
     die('no API key configured; set KEY or write one to', config.get('key_file'))
   print('No API key configured.')
-  key = getpass.getpass('API key: ').strip()
+  key = clean_secret(getpass.getpass('API key: '))
   if not key:
     die('aborted')
   path = Path(expand(config.get('key_file') or DEFAULT_KEY_FILE))
@@ -88,7 +96,7 @@ def prompt_for_key(config):
   os.chmod(path, 0o600)
   config['key_file'] = str(path)
   save_config(config)
-  print('Saved', path)
+  print('Saved', path, '->', mask(key))
   return config
 
 def ua_path():
@@ -307,6 +315,36 @@ def set_log(config, path = ''):
   save_config(config)
   print('Log file set to', config['log'])
 
+def doctor(config):
+  print('config:    ', CONFIG_FILE)
+  print('ua:        ', ua_path())
+  print('python:    ', sys.version.split()[0], sys.executable)
+  print('api:       ', config.get('api') or DEFAULT_API)
+  print('models url:', models_url(config))
+  print('model:     ', config.get('model') or '(none)')
+  print('reasoning: ', config.get('reasoning', 'model default'))
+  print('log:       ', config.get('log') or str(Path.cwd() / 'ua.log'))
+  if os.environ.get('KEY'):
+    print('key:        from $KEY', mask(clean_secret(os.environ['KEY'])))
+  elif config.get('key'):
+    print('key:        from config', mask(clean_secret(config['key'])))
+  else:
+    path = config.get('key_file')
+    key = None
+    if path and Path(expand(path)).exists():
+      with suppress(OSError):
+        key = clean_secret(Path(expand(path)).read_text(encoding = 'utf-8'))
+    if key:
+      print('key:        from', path, mask(key))
+    else:
+      print('key:        NOT SET (expected at', path, ')')
+  cache = load_json(CACHE_FILE, None)
+  if cache and cache.get('models'):
+    age = int((time.time() - cache.get('updated', 0)) / 3600)
+    print('models:    ', len(cache['models']), f'cached, {age}h old')
+  else:
+    print('models:     no cache; run:', NAME, 'models --refresh')
+
 def colourise_recap(text):
   lines = []
   for line in text.splitlines():
@@ -404,6 +442,8 @@ def command(config, line):
       print()
   elif name in ('help', 'h', '?'):
     help_text()
+  elif name in ('doctor', 'diag'):
+    doctor(config)
   else:
     print('Unknown command', repr(name), '- try /help')
 
@@ -416,9 +456,12 @@ def help_text():
   /log [PATH]      show or set the conversation log
   /recap           print the conversation so far
   /edit            compose a message in $EDITOR
+  /doctor          show paths, model, key source and cache status
   /help            this message
   /quit            leave
-  Enter            send, Ctrl-J (or Shift-Enter) inserts a newline''')
+  Enter            send, Ctrl-J (or Shift-Enter) inserts a newline
+  Ctrl-C twice     quit (once clears the line you are typing)
+  Ctrl-D           quit''')
 
 def chat(config):
   if not resolve_key(config):
@@ -430,13 +473,19 @@ def chat(config):
       die('no model configured; run:', NAME, 'model')
   banner(config)
   load_history()
+  interrupted = False
   try:
     while True:
       try:
         text = compose(config)
       except KeyboardInterrupt:
-        print()
+        if interrupted:
+          print()
+          break
+        interrupted = True
+        print(sgr(2, '(Ctrl-C again to quit, or Ctrl-D / /quit)'))
         continue
+      interrupted = False
       if text is None:
         break
       text = text.strip()
@@ -465,6 +514,7 @@ Actions:
   fav [MODEL]          toggle or list favourite models
   log [PATH]           show or set the conversation log file
   config               print the configuration file path
+  doctor               diagnose config, key, model and cache
   abort agent recap system user
                        run the corresponding ua action directly
 Configuration is stored in {CONFIG_FILE}.
@@ -494,6 +544,8 @@ def main(argv):
       set_log(config, rest[0] if rest else '')
     case 'config':
       print(CONFIG_FILE)
+    case 'doctor' | 'diag':
+      doctor(config)
     case 'abort' | 'agent' | 'recap' | 'system' | 'user':
       sys.exit(run(config, action))
     case 'help' | '-h' | '--help':
