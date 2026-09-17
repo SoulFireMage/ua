@@ -14,6 +14,11 @@ correct for your system before copying it to a directory on your path.
 The tool has no dependencies beyond the standard library. It is configured
 through the environment.
 
+An optional interactive front end, examples/uachat, is also provided. It
+too uses only the standard library and calls ua via python3, so the core
+script's #! path need not be correct for the wrapper to work. It is
+described in Interactive wrapper below.
+
 Set API, KEY and MODEL to the endpoint, bearer key and model ID, e.g.
 
   export API=https://openrouter.ai/api/v1/responses
@@ -64,6 +69,40 @@ if you want to interrupt the model to provide updated instructions,
 and when prompting the model to fork copies of its own state.
 
 'ua recap' will print the message history from the log to stdout.
+
+
+Interactive wrapper
+-------------------
+
+examples/uachat is a small, dependency-free front end which adds a model
+picker and a boxed multi-line composer, storing its configuration in
+~/.config/ua/config.json and leaving the core ua script unchanged.
+
+Run 'uachat' to start a chat loop. Type a message and press Enter to
+send it; Ctrl-J or Shift-Enter inserts a newline. The slash commands are:
+
+  /model [QUERY]    pick a model from the API's model list (saved)
+  /models [QUERY]   list matching models; --refresh refetches
+  /reasoning [E]    set reasoning effort, 'off' or 'default'
+  /fav [MODEL]      add or remove a favourite model
+  /log [PATH]       show or set the conversation log
+  /recap            print the conversation so far
+  /edit             compose a message in $EDITOR
+  /help, /quit
+
+'uachat model' chooses a model at the command line and saves it for next
+time, while 'uachat models QUERY' lists matches. The model list is read
+from the API's /models endpoint and cached for a day in
+~/.config/ua/models.json, so the picker still works offline. If no key is
+configured, uachat prompts for one and writes it to the key file named in
+the configuration, mode 600.
+
+The core actions can also be run directly, e.g. 'uachat agent' or
+'uachat recap', with the configured API, key, model and log passed in the
+environment. Set UA if uachat cannot find ua beside it, and EDITOR to
+choose the editor used by /edit. Because uachat invokes ua with python3,
+it works even where the core script's #! line does not match the local
+interpreter path.
 
 
 Copying

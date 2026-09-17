@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+
+import getpass, json, os, re, shutil, subprocess, sys, tempfile, time
+import urllib.error, urllib.request
+from pathlib import Path
+from contextlib import suppress
+
+try:
+  import readline
+except ImportError:
+  readline = None
+
+NAME = 'uachat'
+CONFIG_DIR = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'ua'
+CONFIG_FILE = CONFIG_DIR / 'config.json'
+CACHE_FILE = CONFIG_DIR / 'models.json'
+HISTORY_FILE = CONFIG_DIR / 'history'
+DEFAULT_API = 'https://openrouter.ai/api/v1/responses'
+DEFAULT_KEY_FILE = '~/.config/ua/key'
+CACHE_TTL = 24 * 60 * 60
+
+if sys.stdout.isatty() and not os.environ.get('NO_COLOR'):
+  def sgr(code, text):
+    return f'\x1b[{code}m{text}\x1b[0m'
+else:
+  def sgr(code, text):
+    return text
+
+def die(*args):
+  print(NAME, *args, file = sys.stderr, sep = ': ')
+  sys.exit(1)
+
+def expand(path):
+  return os.path.expanduser(os.path.expandvars(str(path)))
+
+def load_json(path, default):
+  try:
+    with open(path, 'r', encoding = 'utf-8') as stream:
+      return json.load(stream)
+  except (OSError, ValueError):
+    return default
+
+def save_json(path, data):
+  path.parent.mkdir(parents = True, exist_ok = True)
+  with open(path, 'w', encoding = 'utf-8') as stream:
+    json.dump(data, stream, indent = 2)
+    stream.write('\n')
+
+def ensure_config():
+  if not CONFIG_FILE.exists():
+    save_json(CONFIG_FILE, {
+      'api': DEFAULT_API,
+      'key_file': DEFAULT_KEY_FILE,
+      'model': '',
+      'favorites': []
+    })
+  config = load_json(CONFIG_FILE, {})
+  config.setdefault('api', DEFAULT_API)
+  config.setdefault('key_file', DEFAULT_KEY_FILE)
+  config.setdefault('model', '')
+  config.setdefault('favorites', [])
+  return config
+
+def save_config(config):
+  save_json(CONFIG_FILE, config)
+
+def resolve_key(config):
+  if os.environ.get('KEY'):
+    return os.environ['KEY']
+  if config.get('key'):
+    return config['key']
+  path = config.get('key_file')
+  if path and Path(expand(path)).exists():
+    with suppress(OSError):
+      return Path(expand(path)).read_text(encoding = 'utf-8').strip()
+  return None
+
+def prompt_for_key(config):
+  if not sys.stdin.isatty():
+    die('no API key configured; set KEY or write one to', config.get('key_file'))
+  print('No API key configured.')
+  key = getpass.getpass('API key: ').strip()
+  if not key:
+    die('aborted')
+  path = Path(expand(config.get('key_file') or DEFAULT_KEY_FILE))
+  path.parent.mkdir(parents = True, exist_ok = True)
+  path.write_text(key + '\n', encoding = 'utf-8')
+  os.chmod(path, 0o600)
+  config['key_file'] = str(path)
+  save_config(config)
+  print('Saved', path)
+  return config
+
+def ua_path():
+  if os.environ.get('UA'):
+    return os.environ['UA']
+  here = Path(__file__).resolve().parent
+  for candidate in (here / 'ua', here.parent / 'ua'):
+    if candidate.exists():
+      return str(candidate)
+  found = shutil.which('ua')
+  if found:
+    return found
+  die('cannot find the ua script; set UA to its path')
+
+def child_env(config):
+  env = dict(os.environ)
+  env['API'] = config.get('api') or DEFAULT_API
+  if key := resolve_key(config):
+    env['KEY'] = key
+  if config.get('model'):
+    env['MODEL'] = config['model']
+  if 'reasoning' in config:
+    env['REASONING'] = config.get('reasoning') or ''
+  for key, name in (('log', 'LOG'), ('shell', 'SHELL'), ('tools', 'TOOLS')):
+    if config.get(key):
+      env[name] = expand(config[key])
+  return env
+
+def run(config, action, stdin = None, capture = False):
+  command = [sys.executable, ua_path(), action]
+  sys.stdout.flush()
+  if capture:
+    process = subprocess.run(command, env = child_env(config),
+      capture_output = True, text = True)
+    return process.returncode, process.stdout
+  if stdin is None:
+    return subprocess.call(command, env = child_env(config))
+  process = subprocess.run(command, env = child_env(config),
+    input = stdin, text = True)
+  return process.returncode
+
+def models_url(config):
+  if config.get('models_url'):
+    return config['models_url']
+  api = (config.get('api') or DEFAULT_API).rstrip('/')
+  if api.endswith('/responses'):
+    api = api[:-len('/responses')]
+  return api + '/models'
+
+def fetch_models(config):
+  request = urllib.request.Request(models_url(config), headers = {
+    'Accept': 'application/json', 'User-Agent': NAME
+  })
+  if key := resolve_key(config):
+    request.add_header('Authorization', 'Bearer ' + key)
+  with urllib.request.urlopen(request, timeout = 20) as stream:
+    data = json.load(stream)
+  rows = data.get('data', data) if isinstance(data, dict) else data
+  models = []
+  for row in rows or []:
+    if isinstance(row, str):
+      row = { 'id': row }
+    if not isinstance(row, dict):
+      continue
+    id = row.get('id') or row.get('name')
+    if not id:
+      continue
+    models.append({
+      'id': str(id),
+      'name': str(row.get('name') or id),
+      'context': row.get('context_length') or row.get('context_window')
+    })
+  models.sort(key = lambda model: model['id'])
+  return models
+
+def get_models(config, refresh = False):
+  cache = load_json(CACHE_FILE, None)
+  if not refresh and cache and time.time() - cache.get('updated', 0) < CACHE_TTL:
+    return cache.get('models', [])
+  try:
+    models = fetch_models(config)
+    if models:
+      save_json(CACHE_FILE, { 'updated': time.time(), 'models': models })
+      return models
+    raise ValueError('empty model list')
+  except Exception as error:
+    if cache and cache.get('models'):
+      print(sgr(2, f'Using cached models ({error})'))
+      return cache['models']
+    die('could not fetch models:', error)
+
+def search(models, query):
+  if not query:
+    return list(models)
+  if len(query) > 1 and query.startswith('/') and query.endswith('/'):
+    with suppress(re.error):
+      pattern = re.compile(query[1:-1], re.IGNORECASE)
+      return [model for model in models if pattern.search(model['id'])]
+  query = query.lower()
+  return [model for model in models
+    if query in model['id'].lower() or query in model['name'].lower()]
+
+def describe(model):
+  context = model.get('context')
+  with suppress(TypeError, ValueError):
+    return f'{int(context) // 1000}k'
+  return ''
+
+def list_models(config, query = '', refresh = False):
+  models = get_models(config, refresh)
+  matches = search(models, query)
+  if not matches:
+    die('no models match', repr(query))
+  for model in matches:
+    context = describe(model)
+    print(model['id'], sgr(2, context), sep = '\t')
+
+def choose(config, models, query):
+  matches = search(models, query)
+  favorites = config.get('favorites') or []
+  if not matches:
+    print('No models match', repr(query))
+    return None
+  if not query:
+    matches.sort(key = lambda model: (model['id'] not in favorites, model['id']))
+  shown = matches[:40]
+  for index, model in enumerate(shown, 1):
+    star = '*' if model['id'] in favorites else ' '
+    print(f'{star}{index:>3}) {model["id"]}', sgr(2, describe(model)), sep = '  ')
+  if len(matches) > len(shown):
+    print(sgr(2, f'    ... and {len(matches) - len(shown)} more; refine your filter'))
+  try:
+    answer = input('select # or id (empty to refine): ').strip()
+  except (EOFError, KeyboardInterrupt):
+    print()
+    return None
+  if not answer:
+    return None
+  if answer.isdigit() and 1 <= int(answer) <= len(shown):
+    return shown[int(answer) - 1]['id']
+  if any(model['id'] == answer for model in matches):
+    return answer
+  partial = [model['id'] for model in matches if answer.lower() in model['id'].lower()]
+  if len(partial) == 1:
+    return partial[0]
+  return None
+
+def pick_model(config, query = ''):
+  models = get_models(config)
+  if not sys.stdin.isatty():
+    for model in search(models, query):
+      print(model['id'])
+    return None
+  query = query.strip()
+  while True:
+    if query:
+      chosen = choose(config, models, query)
+      if chosen:
+        break
+    try:
+      query = input('filter model (empty = all, /regex/ ok): ').strip()
+    except (EOFError, KeyboardInterrupt):
+      print()
+      return None
+    if not query:
+      chosen = choose(config, models, '')
+      if chosen:
+        break
+  config['model'] = chosen
+  save_config(config)
+  print('Model set to', sgr(1, chosen))
+  return chosen
+
+def favourite(config, model_id = ''):
+  favorites = config.setdefault('favorites', [])
+  if not model_id:
+    for name in favorites:
+      print(name)
+    if not favorites:
+      print('No favourite models yet; use /fav MODEL.')
+    return
+  if model_id in favorites:
+    favorites.remove(model_id)
+    print('Removed favourite', model_id)
+  else:
+    favorites.append(model_id)
+    print('Added favourite', model_id)
+  save_config(config)
+
+def set_reasoning(config, effort = None):
+  if effort is None:
+    current = config.get('reasoning', None)
+    print('Reasoning effort:', current if current not in (None, '') else
+      ('model default' if current is None else 'disabled'))
+    return
+  if effort in ('default', 'unset'):
+    config.pop('reasoning', None)
+    print('Reasoning effort reset to model default')
+  elif effort in ('none', 'off', 'disabled', ''):
+    config['reasoning'] = ''
+    print('Reasoning disabled')
+  else:
+    config['reasoning'] = effort
+    print('Reasoning effort set to', effort)
+  save_config(config)
+
+def set_log(config, path = ''):
+  if not path:
+    print('Log file:', config.get('log') or str(Path.cwd() / 'ua.log'))
+    return
+  target = Path(expand(path))
+  if target.is_dir():
+    target = target / 'ua.log'
+  target.parent.mkdir(parents = True, exist_ok = True)
+  config['log'] = str(target.resolve())
+  save_config(config)
+  print('Log file set to', config['log'])
+
+def colourise_recap(text):
+  lines = []
+  for line in text.splitlines():
+    if line.startswith('> '):
+      lines.append(sgr(32, line[2:]))
+    elif line.startswith('| '):
+      lines.append(sgr(34, line[2:]))
+    else:
+      lines.append(line[2:] if line.startswith('< ') else line)
+  return '\n'.join(lines) + ('\n' if text else '')
+
+def editor_text():
+  editor = os.environ.get('EDITOR') or shutil.which('nano') or shutil.which('vi')
+  if not editor:
+    die('no editor found; set EDITOR')
+  with tempfile.NamedTemporaryFile(mode = 'w+', suffix = '.md',
+      encoding = 'utf-8') as tmp:
+    if subprocess.call([editor, tmp.name]) != 0:
+      return ''
+    tmp.seek(0)
+    return tmp.read().strip('\n')
+
+BORDER = '+' if os.environ.get('UA_ASCII') else None
+if BORDER:
+  TL = TR = BL = BR = '+'
+  HORIZONTAL = VERTICAL = '-'
+else:
+  TL, TR, BL, BR = '\u256d', '\u256e', '\u2570', '\u256f'
+  HORIZONTAL, VERTICAL = '\u2500', '\u2502'
+
+def set_composer_keys():
+  if readline:
+    readline.parse_and_bind(r'"\C-j": "\C-v\C-j"')
+    readline.parse_and_bind(r'"\e[13;2u": "\C-v\C-j"')
+    readline.parse_and_bind(r'"\e\r": "\C-v\C-j"')
+    readline.set_history_length(1000)
+
+def load_history():
+  if readline and HISTORY_FILE.exists():
+    with suppress(Exception):
+      readline.read_history_file(HISTORY_FILE)
+
+def save_history():
+  if readline:
+    CONFIG_DIR.mkdir(parents = True, exist_ok = True)
+    with suppress(Exception):
+      readline.write_history_file(HISTORY_FILE)
+
+def compose(config):
+  width = shutil.get_terminal_size((80, 24)).columns
+  label = f' {config.get("model") or "no model"} '
+  bar = HORIZONTAL * max(width - len(label) - 3, 1)
+  print(sgr(2, TL + HORIZONTAL + label + bar + TR))
+  try:
+    text = input(VERTICAL + ' ')
+  except EOFError:
+    print(sgr(2, BL + HORIZONTAL * max(width - 2, 1) + BR))
+    return None
+  print(sgr(2, BL + HORIZONTAL * max(width - 2, 1) + BR))
+  return text
+
+def banner(config):
+  where = config.get('log') or str(Path.cwd() / 'ua.log')
+  print(sgr(2, f'{NAME} - /help for commands, /model to switch model'))
+  print(sgr(2, f'log: {where}'))
+  print()
+
+def send(config, text):
+  run(config, 'user', stdin = text)
+
+def command(config, line):
+  parts = line[1:].split(None, 1)
+  name = parts[0].lower() if parts else ''
+  argument = parts[1].strip() if len(parts) > 1 else ''
+  if name in ('q', 'quit', 'exit'):
+    return True
+  elif name in ('m', 'model'):
+    pick_model(config, argument)
+  elif name == 'models':
+    refresh = argument in ('--refresh', '-r')
+    list_models(config, '' if refresh else argument, refresh = refresh)
+  elif name in ('r', 'reasoning'):
+    set_reasoning(config, argument or None)
+  elif name == 'recap':
+    _, output = run(config, 'recap', capture = True)
+    sys.stdout.write(colourise_recap(output))
+  elif name in ('fav', 'favorite'):
+    favourite(config, argument)
+  elif name == 'log':
+    set_log(config, argument)
+  elif name in ('edit', 'e'):
+    if text := editor_text():
+      send(config, text)
+      run(config, 'agent')
+      print()
+  elif name in ('help', 'h', '?'):
+    help_text()
+  else:
+    print('Unknown command', repr(name), '- try /help')
+
+def help_text():
+  print('''\
+  /model [QUERY]   pick a model (saved for next time)
+  /models [Q]      list matching models (/models --refresh to refetch)
+  /reasoning [E]   set effort, or 'off'/'default' (no argument shows it)
+  /fav [MODEL]     add/remove a favourite model
+  /log [PATH]      show or set the conversation log
+  /recap           print the conversation so far
+  /edit            compose a message in $EDITOR
+  /help            this message
+  /quit            leave
+  Enter            send, Ctrl-J (or Shift-Enter) inserts a newline''')
+
+def chat(config):
+  if not resolve_key(config):
+    config = prompt_for_key(config)
+  if not config.get('model'):
+    if sys.stdin.isatty() and sys.stdout.isatty():
+      pick_model(config)
+    else:
+      die('no model configured; run:', NAME, 'model')
+  banner(config)
+  load_history()
+  try:
+    while True:
+      try:
+        text = compose(config)
+      except KeyboardInterrupt:
+        print()
+        continue
+      if text is None:
+        break
+      text = text.strip()
+      if not text:
+        run(config, 'agent')
+        print()
+      elif text.startswith('/'):
+        if command(config, text):
+          break
+      else:
+        send(config, text)
+        run(config, 'agent')
+        print()
+  finally:
+    save_history()
+  print()
+
+def usage():
+  print(f'''\
+Usage: {NAME} [ACTION] [ARGUMENT]
+Actions:
+  chat                 start the interactive chat loop (default)
+  model [QUERY]        search for and select a model, saved to config
+  models [QUERY]       list matching models (--refresh to refetch)
+  reasoning [EFFORT]   set reasoning effort, 'off' or 'default'
+  fav [MODEL]          toggle or list favourite models
+  log [PATH]           show or set the conversation log file
+  config               print the configuration file path
+  abort agent recap system user
+                       run the corresponding ua action directly
+Configuration is stored in {CONFIG_FILE}.
+Environment: API, KEY, MODEL, UA, EDITOR, NO_COLOR, UA_ASCII
+''', end = '', file = sys.stderr)
+  sys.exit(64)
+
+def main(argv):
+  set_composer_keys()
+  config = ensure_config()
+  action = argv[0] if argv else 'chat'
+  rest = argv[1:]
+  match action:
+    case 'chat':
+      chat(config)
+    case 'model':
+      pick_model(config, rest[0] if rest else '')
+    case 'models':
+      refresh = '--refresh' in rest or '-r' in rest
+      query = next((arg for arg in rest if arg not in ('--refresh', '-r')), '')
+      list_models(config, query, refresh = refresh)
+    case 'reasoning':
+      set_reasoning(config, rest[0] if rest else None)
+    case 'fav' | 'favorite':
+      favourite(config, rest[0] if rest else '')
+    case 'log':
+      set_log(config, rest[0] if rest else '')
+    case 'config':
+      print(CONFIG_FILE)
+    case 'abort' | 'agent' | 'recap' | 'system' | 'user':
+      sys.exit(run(config, action))
+    case 'help' | '-h' | '--help':
+      usage()
+    case _:
+      usage()
+
+if __name__ == '__main__':
+  try:
+    main(sys.argv[1:])
+  except KeyboardInterrupt:
+    sys.exit(130)
